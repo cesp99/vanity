@@ -54,6 +54,7 @@ pub fn match_lut(case_insensitive: bool) -> &'static [u8; 58] {
 
 struct PatternIdx {
     prefix_ranges: Option<Vec<([u8; 32], [u8; 32])>>,
+    suffix_residue: Option<SuffixResidue>,
     prefix_idx: [u8; MAX_PATTERN_LEN],
     prefix_len: u8,
     suffix_idx: [u8; MAX_PATTERN_LEN],
@@ -105,6 +106,10 @@ impl MatchTargets {
             }
             out.push(PatternIdx {
                 prefix_ranges: prefix_ranges(prefix, case_insensitive),
+                suffix_residue: SuffixResidue::new(
+                    suffix,
+                    case_insensitive,
+                ),
                 prefix_idx,
                 prefix_len: prefix.len() as u8,
                 suffix_idx,
@@ -149,6 +154,11 @@ impl MatchTargets {
                     continue;
                 }
             }
+            if let Some(r) = &p.suffix_residue {
+                if !r.holds(bytes) {
+                    continue;
+                }
+            }
             encode_active |= 1u64 << pi;
         }
         if encode_active != 0 {
@@ -160,6 +170,54 @@ impl MatchTargets {
             );
         }
         mask
+    }
+
+    /// Like [`Self::match_mask_active`], but always through the base58 walk,
+    /// so it can catch a disagreement with the byte ranges.
+    pub fn match_mask_encoded(
+        &self,
+        bytes: &[u8; 32],
+        active: u64,
+    ) -> u64 {
+        check_match_32(bytes, &self.patterns, self.match_lut, active)
+    }
+
+    /// Sorted, disjoint `(lo, span)` intervals over a key's first eight bytes
+    /// read big-endian. Any key matching an `active` pattern lands in one,
+    /// so a key outside them all needs no further checks. None when an active
+    /// pattern can't be expressed this way (suffix-only, a leading '1', or
+    /// case-insensitive with more than [`MAX_CI_VARIANTS`] case variants),
+    /// and every key has to go to the exact check.
+    #[cfg(any(test, target_arch = "x86_64"))]
+    pub fn prefix_filter(
+        &self,
+        active: u64,
+    ) -> Option<Vec<(u64, u64)>> {
+        let mut bounds = Vec::new();
+        for (pi, p) in self.patterns.iter().enumerate() {
+            if active & (1u64 << pi) == 0 {
+                continue;
+            }
+            for (lo, hi) in p.prefix_ranges.as_ref()? {
+                bounds.push((first8(lo), first8(hi)));
+            }
+        }
+        bounds.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (lo, hi) in bounds {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1.saturating_add(1) => {
+                    last.1 = last.1.max(hi);
+                }
+                _ => merged.push((lo, hi)),
+            }
+        }
+        Some(
+            merged
+                .iter()
+                .map(|&(lo, hi)| (lo, hi - lo))
+                .collect(),
+        )
     }
 
     /// Canonical-index blob consumed by `gpu_grind_init` / `gpu_keypair_init`.
@@ -201,6 +259,12 @@ impl MatchTargets {
     }
 }
 
+#[cfg(any(test, target_arch = "x86_64"))]
+#[inline]
+fn first8(bytes: &[u8; 32]) -> u64 {
+    u64::from_be_bytes(bytes[..8].try_into().unwrap())
+}
+
 #[inline]
 fn char_to_canonical(
     c: u8,
@@ -215,14 +279,61 @@ fn char_to_canonical(
     255
 }
 
-// Exact prefixes can be checked as byte ranges without base58
-// conversion. Keep the encode matcher for leading '1' and
-// case-insensitive searches.
+/// Most case variants a case-insensitive prefix is expanded into for the
+/// byte-range check. There are 2^letters of them, each adding an interval or
+/// two to the prefix filter, so longer ones go to the base58 walk.
+pub const MAX_CI_VARIANTS: usize = 256;
+
+/// Every case-sensitive pattern that `pattern` (already folded, as
+/// [`MatchTargets::new`] takes it) matches case-insensitively: each
+/// character becomes every alphabet character that folds to it, so `L` and
+/// the digits stay as they are. None when there would be more than `max`.
+pub fn ci_variants(pattern: &str, max: usize) -> Option<Vec<String>> {
+    let mut out = vec![String::new()];
+    for b in pattern.bytes() {
+        let choices: Vec<char> = ALPHABET
+            .iter()
+            .zip(ALPHABET_CI)
+            .filter(|&(_, &folded)| folded == b)
+            .map(|(&c, _)| c as char)
+            .collect();
+        if choices.is_empty() || out.len() * choices.len() > max {
+            return None;
+        }
+        out = out
+            .iter()
+            .flat_map(|v| {
+                choices
+                    .iter()
+                    .map(move |&c| format!("{v}{c}"))
+            })
+            .collect();
+    }
+    Some(out)
+}
+
+// Prefixes can be checked as byte ranges without base58 conversion; a
+// case-insensitive one is the union of its case variants' ranges. Keep the
+// encode matcher for a leading '1' and for too many case variants.
 fn prefix_ranges(
     prefix: &str,
     ci: bool,
 ) -> Option<Vec<([u8; 32], [u8; 32])>> {
-    if ci || prefix.is_empty() || prefix.starts_with('1') {
+    if !ci {
+        return exact_prefix_ranges(prefix);
+    }
+    let mut ranges = Vec::new();
+    for variant in ci_variants(prefix, MAX_CI_VARIANTS)? {
+        ranges.extend(exact_prefix_ranges(&variant)?);
+    }
+    ranges.sort_unstable();
+    Some(ranges)
+}
+
+fn exact_prefix_ranges(
+    prefix: &str,
+) -> Option<Vec<([u8; 32], [u8; 32])>> {
+    if prefix.is_empty() || prefix.starts_with('1') {
         return None;
     }
     let mut value = BigUint::from(0u8);
@@ -249,6 +360,63 @@ fn prefix_ranges(
         scale *= 58u8;
     }
     Some(ranges)
+}
+
+/// The last characters of a base58 string are the low base58 digits of the
+/// number it encodes, and a leading '1' is a zero digit, so a key can only
+/// end in `suffix` if `N mod 58^k` equals the value of its last `k`
+/// characters. A necessary condition, checked before the base58 walk.
+struct SuffixResidue {
+    modulus: u64,
+    residue: u64,
+    /// `2^(32 * (7 - i)) mod modulus`, the weight of big-endian word `i`.
+    scale: [u64; 8],
+}
+
+/// Characters the residue covers. 58^4 < 2^24, so each word times its
+/// scale stays below 2^56 and the sum of eight fits a u64.
+const SUFFIX_RESIDUE_LEN: usize = 4;
+
+impl SuffixResidue {
+    fn new(suffix: &str, ci: bool) -> Option<Self> {
+        if ci || suffix.is_empty() {
+            return None;
+        }
+        let tail = &suffix.as_bytes()[suffix
+            .len()
+            .saturating_sub(SUFFIX_RESIDUE_LEN)..];
+        let (mut modulus, mut residue) = (1u64, 0u64);
+        for b in tail {
+            residue = residue * 58
+                + ALPHABET.iter().position(|c| c == b)? as u64;
+            modulus *= 58;
+        }
+        let mut scale = [0u64; 8];
+        let mut w = 1 % modulus;
+        for i in (0..8).rev() {
+            scale[i] = w;
+            w = (w << 32) % modulus;
+        }
+        Some(Self {
+            modulus,
+            residue,
+            scale,
+        })
+    }
+
+    #[inline]
+    fn holds(&self, bytes: &[u8; 32]) -> bool {
+        let mut sum = 0u64;
+        for i in 0..8 {
+            let w = u32::from_be_bytes(
+                bytes[i * 4..i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            sum += u64::from(w) * self.scale[i];
+        }
+        sum % self.modulus == self.residue
+    }
 }
 
 #[inline]
@@ -486,8 +654,59 @@ mod tests {
     fn prefix_ranges_skip_leading_one_and_ci() {
         assert!(prefix_ranges("Harmonic", false).is_some());
         assert!(prefix_ranges("1abc", false).is_none());
-        assert!(prefix_ranges("Harmonic", true).is_none());
         assert!(prefix_ranges("", false).is_none());
+        assert!(prefix_ranges("1abc", true).is_none());
+        // 2^6 case variants (no uppercase i or o), then 2^9 > 256.
+        assert!(prefix_ranges("harmonic", true).is_some());
+        assert!(prefix_ranges("abcdefghj", true).is_none());
+    }
+
+    #[test]
+    fn ci_variants_fold_like_the_matcher() {
+        let mut v = ci_variants("cesp99", 64).unwrap();
+        v.sort_unstable();
+        assert_eq!(v.len(), 16);
+        assert_eq!(v[0], "CESP99");
+        assert_eq!(v[15], "cesp99");
+        // Base58 has no uppercase i or o and no lowercase l.
+        assert_eq!(ci_variants("io", 64).unwrap(), ["io"]);
+        assert_eq!(ci_variants("L2", 64).unwrap(), ["L2"]);
+        let mut v = ci_variants("k", 64).unwrap();
+        v.sort_unstable();
+        assert_eq!(v, ["K", "k"]);
+        assert!(ci_variants("abc", 4).is_none());
+        assert_eq!(ci_variants("", 1).unwrap(), [""]);
+    }
+
+    /// The case-insensitive byte ranges and filter against a lowercased
+    /// encode, on uniform keys and on keys biased toward short addresses.
+    #[test]
+    fn ci_prefix_filter_agrees_with_encode() {
+        let patterns: &[(&str, &str)] =
+            &[("ce", ""), ("z", ""), ("b", "q"), ("4h", "")];
+        let target = MatchTargets::new(patterns, true);
+        let iv = target.prefix_filter(u64::MAX).unwrap();
+        let mut hits = [0u32; 4];
+        for i in 0u32..100_000 {
+            let h: [u8; 64] = Sha512::digest(i.to_le_bytes()).into();
+            let mut key: [u8; 32] = h[..32].try_into().unwrap();
+            if i % 2 == 0 {
+                key[0] = (i % 32) as u8;
+            }
+            let mut expect = 0u64;
+            for (j, (p, sfx)) in patterns.iter().enumerate() {
+                if encode_matches(&key, p, sfx, true) {
+                    expect |= 1 << j;
+                    hits[j] += 1;
+                }
+            }
+            let addr = fd_bs58::encode_32(key);
+            assert_eq!(target.match_mask(&key), expect, "{addr}");
+            if expect != 0 {
+                assert!(passes_filter(&key, &iv), "{addr}");
+            }
+        }
+        assert!(hits.iter().all(|&h| h > 20), "{hits:?}");
     }
 
     #[test]
@@ -498,6 +717,279 @@ mod tests {
         assert_eq!(hit.match_mask(&bytes), 0b1);
         let miss = MatchTargets::new(&[("XkD", "")], false);
         assert_eq!(miss.match_mask(&bytes), 0);
+    }
+
+    fn passes_filter(bytes: &[u8; 32], iv: &[(u64, u64)]) -> bool {
+        let f = first8(bytes);
+        iv.iter()
+            .any(|&(lo, span)| f.wrapping_sub(lo) <= span)
+    }
+
+    fn to_key(n: &BigUint) -> [u8; 32] {
+        let v = n.to_bytes_be();
+        let mut out = [0u8; 32];
+        out[32 - v.len()..].copy_from_slice(&v);
+        out
+    }
+
+    /// Exact match and filter against a real base58 encode, for one key.
+    fn check_key(
+        target: &MatchTargets,
+        iv: &[(u64, u64)],
+        patterns: &[(&str, &str)],
+        key: &[u8; 32],
+    ) -> bool {
+        let mut expect = 0u64;
+        for (i, (p, s)) in patterns.iter().enumerate() {
+            if encode_matches(key, p, s, false) {
+                expect |= 1 << i;
+            }
+        }
+        assert_eq!(
+            target.match_mask(key),
+            expect,
+            "{}",
+            fd_bs58::encode_32(*key)
+        );
+        assert_eq!(
+            target.match_mask_encoded(key, u64::MAX),
+            expect,
+            "{}",
+            fd_bs58::encode_32(*key)
+        );
+        // Conservative: a real match must always pass the filter.
+        if expect != 0 {
+            assert!(
+                passes_filter(key, iv),
+                "{}",
+                fd_bs58::encode_32(*key)
+            );
+        }
+        expect != 0
+    }
+
+    /// The value base58 decodes `s` to, and 58^len(s).
+    fn suffix_value(s: &str) -> (BigUint, BigUint) {
+        let mut value = BigUint::from(0u8);
+        let mut modulus = BigUint::one();
+        for b in s.bytes() {
+            value = value * 58u8
+                + ALPHABET
+                    .iter()
+                    .position(|&c| c == b)
+                    .unwrap();
+            modulus *= 58u8;
+        }
+        (value, modulus)
+    }
+
+    #[test]
+    fn prefix_filter_exact_at_range_boundaries() {
+        // The largest and smallest filterable keys, as whole addresses.
+        let top = fd_bs58::encode_32([0xffu8; 32]);
+        let mut bottom_key = [0u8; 32];
+        bottom_key[0] = 1;
+        let bottom = fd_bs58::encode_32(bottom_key);
+        let cases: &[&[(&str, &str)]] = &[
+            &[("Cesp99", "")],
+            &[("Cesp99", "a")],
+            &[("Cesp99", "pq"), ("Cesp", "z")],
+            &[("Cesp99", ""), ("zzzz", ""), ("2", "")],
+            // A pattern so long that only one address length can hold it.
+            &[("Cesp99aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "")],
+            &[(top.as_str(), "")],
+            &[(bottom.as_str(), "")],
+            &[("z", ""), ("2", "")],
+        ];
+        for patterns in cases {
+            let target = MatchTargets::new(patterns, false);
+            let iv = target.prefix_filter(u64::MAX).unwrap();
+            let max = (BigUint::one() << 256usize) - 1u8;
+            let mut boundary_hits = 0;
+            for (p, suffix) in patterns.iter() {
+                let (want, modulus) = suffix_value(suffix);
+                for (lo, hi) in prefix_ranges(p, false).unwrap() {
+                    let lo_n = BigUint::from_bytes_be(&lo);
+                    let hi_n = BigUint::from_bytes_be(&hi);
+                    let mut keys = vec![lo, hi];
+                    if lo_n > BigUint::from(0u8) {
+                        keys.push(to_key(&(&lo_n - 1u8)));
+                    }
+                    if hi_n < max {
+                        keys.push(to_key(&(&hi_n + 1u8)));
+                    }
+                    // Same first eight bytes as the bounds, other tails.
+                    for b in [lo, hi] {
+                        for fill in [0u8, 0xff] {
+                            let mut k = [fill; 32];
+                            k[..8].copy_from_slice(&b[..8]);
+                            keys.push(k);
+                        }
+                    }
+                    // The nearest key to each bound that has the suffix.
+                    let up = (&want + &modulus - (&lo_n % &modulus))
+                        % &modulus;
+                    let first = &lo_n + up;
+                    if first <= hi_n {
+                        keys.push(to_key(&first));
+                    }
+                    let down = (&hi_n + &modulus - &want) % &modulus;
+                    if down <= hi_n && &hi_n - &down >= lo_n {
+                        keys.push(to_key(&(&hi_n - &down)));
+                    }
+                    for key in &keys {
+                        if check_key(&target, &iv, patterns, key) {
+                            boundary_hits += 1;
+                        }
+                    }
+                }
+            }
+            assert!(boundary_hits > 0, "{patterns:?} never matched");
+        }
+    }
+
+    #[test]
+    fn cesp99_ranges_cover_both_address_lengths() {
+        let ranges = prefix_ranges("Cesp99", false).unwrap();
+        let mut lengths: Vec<usize> = Vec::new();
+        for (lo, hi) in &ranges {
+            let lo_s = fd_bs58::encode_32(*lo);
+            let hi_s = fd_bs58::encode_32(*hi);
+            assert!(lo_s.starts_with("Cesp99"), "{lo_s}");
+            assert!(hi_s.starts_with("Cesp99"), "{hi_s}");
+            assert_eq!(lo_s.len(), hi_s.len());
+            lengths.push(lo_s.len());
+            // One value below/above leaves the prefix.
+            let lo_n = BigUint::from_bytes_be(lo);
+            let hi_n = BigUint::from_bytes_be(hi);
+            let below = fd_bs58::encode_32(to_key(&(&lo_n - 1u8)));
+            let above = fd_bs58::encode_32(to_key(&(&hi_n + 1u8)));
+            assert!(!below.starts_with("Cesp99"), "{below}");
+            assert!(!above.starts_with("Cesp99"), "{above}");
+        }
+        lengths.sort_unstable();
+        assert_eq!(lengths, [43, 44]);
+    }
+
+    #[test]
+    fn prefix_filter_agrees_with_encode_on_random_keys() {
+        let patterns: &[(&str, &str)] =
+            &[("C", ""), ("zz", ""), ("9", "a"), ("Ces", "")];
+        let target = MatchTargets::new(patterns, false);
+        let iv = target.prefix_filter(u64::MAX).unwrap();
+        let mut hits = 0;
+        for i in 0u32..50_000 {
+            let h: [u8; 64] = Sha512::digest(i.to_le_bytes()).into();
+            let key: [u8; 32] = h[..32].try_into().unwrap();
+            if check_key(&target, &iv, patterns, &key) {
+                hits += 1;
+            }
+        }
+        assert!(hits > 100, "only {hits} hits");
+    }
+
+    // Keys biased toward 43-character addresses and leading '1's: a uniform
+    // key is a 43-character address only one time in about 30.
+    #[test]
+    fn prefix_filter_agrees_on_short_addresses() {
+        let patterns: &[(&str, &str)] =
+            &[("A", ""), ("Z", ""), ("4", ""), ("1", "")];
+        let iv_patterns = &patterns[..3];
+        let target = MatchTargets::new(iv_patterns, false);
+        let iv = target.prefix_filter(u64::MAX).unwrap();
+        let mut seen = [false; 3];
+        for i in 0u32..50_000 {
+            let h: [u8; 64] = Sha512::digest(i.to_le_bytes()).into();
+            let mut key: [u8; 32] = h[..32].try_into().unwrap();
+            key[0] = (i % 16) as u8;
+            let addr = fd_bs58::encode_32(key);
+            if addr.len() == 43 {
+                seen[0] = true;
+            } else if addr.len() == 44 {
+                seen[1] = true;
+            } else {
+                seen[2] = true;
+            }
+            check_key(&target, &iv, iv_patterns, &key);
+        }
+        assert_eq!(seen, [true; 3], "did not cover every length");
+    }
+
+    #[test]
+    fn prefix_filter_only_where_it_is_exact_enough() {
+        // No filter once an active pattern needs a real encode.
+        let t = MatchTargets::new(&[("abc", ""), ("", "xyz")], false);
+        assert!(t.prefix_filter(u64::MAX).is_none());
+        // Dropping that kind brings the filter back.
+        assert!(t.prefix_filter(0b01).is_some());
+        assert!(t.prefix_filter(0b10).is_none());
+        let t = MatchTargets::new(&[("1abc", "")], false);
+        assert!(t.prefix_filter(u64::MAX).is_none());
+        // Case-insensitive: filtered while the case variants are few.
+        let t = MatchTargets::new(&[("abc", "")], true);
+        assert!(t.prefix_filter(u64::MAX).is_some());
+        let t = MatchTargets::new(&[("abcdefghj", "")], true);
+        assert!(t.prefix_filter(u64::MAX).is_none());
+        // Prefix + suffix filters on the prefix alone.
+        let t = MatchTargets::new(&[("abc", "xyz")], false);
+        assert!(t.prefix_filter(u64::MAX).is_some());
+        // Nothing active: nothing can pass.
+        let t = MatchTargets::new(&[("abc", "")], false);
+        assert_eq!(t.prefix_filter(0).unwrap(), []);
+    }
+
+    #[test]
+    fn prefix_filter_merges_overlaps() {
+        // "z" contains "zz", so only the wider intervals should remain.
+        let wide = MatchTargets::new(&[("z", "")], false)
+            .prefix_filter(u64::MAX)
+            .unwrap();
+        let both = MatchTargets::new(&[("zz", ""), ("z", "")], false)
+            .prefix_filter(u64::MAX)
+            .unwrap();
+        assert_eq!(wide, both);
+        for pair in both.windows(2) {
+            assert!(pair[0].0 + pair[0].1 < pair[1].0);
+        }
+    }
+
+    #[test]
+    fn suffix_residue_agrees_with_encode() {
+        // Every real suffix match must hold the residue; for suffixes of at
+        // most four characters, the residue is exact.
+        let suffixes =
+            ["z", "1", "LM", "11", "zz1", "CooL", "pump", "Cesp99"];
+        let mut held = [0u32; 8];
+        for i in 0u32..20_000 {
+            let h: [u8; 64] = Sha512::digest(i.to_le_bytes()).into();
+            let mut key: [u8; 32] = h[..32].try_into().unwrap();
+            // Short addresses too, where leading '1's pad the encoding.
+            if i % 4 == 0 {
+                key[..(i as usize / 4) % 32].fill(0);
+            }
+            let addr = fd_bs58::encode_32(key);
+            for (j, sfx) in suffixes.iter().enumerate() {
+                let r = SuffixResidue::new(sfx, false).unwrap();
+                let ends = addr.ends_with(sfx);
+                if ends {
+                    assert!(r.holds(&key), "{addr} {sfx}");
+                }
+                if sfx.len() <= SUFFIX_RESIDUE_LEN {
+                    assert_eq!(r.holds(&key), ends, "{addr} {sfx}");
+                }
+                held[j] += r.holds(&key) as u32;
+            }
+        }
+        assert!(held[0] > 100 && held[2] > 0, "{held:?}");
+        for key in [[0u8; 32], [0xff; 32]] {
+            let addr = fd_bs58::encode_32(key);
+            let sfx = &addr[addr.len() - 3..];
+            assert!(SuffixResidue::new(sfx, false)
+                .unwrap()
+                .holds(&key));
+        }
+        assert!(SuffixResidue::new("abc", true).is_none());
+        assert!(SuffixResidue::new("", false).is_none());
     }
 
     #[test]

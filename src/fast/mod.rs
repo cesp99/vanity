@@ -3,19 +3,21 @@ mod field;
 mod group;
 #[cfg(target_arch = "aarch64")]
 mod neon;
+pub mod sha256_simd;
 pub mod sha512_simd;
 pub mod simd;
 
-pub use check_match::{MatchTargets, MAX_PATTERNS, MAX_PATTERN_LEN};
+pub use check_match::{
+    ci_variants, MatchTargets, MAX_CI_VARIANTS, MAX_PATTERNS,
+    MAX_PATTERN_LEN,
+};
 #[cfg(any(test, not(target_arch = "aarch64")))]
 use field::{batch_invert, Fe};
 #[cfg(any(test, not(target_arch = "aarch64")))]
 use group::{edwards_d2, Niels, Point};
+pub use sha256_simd::{grind_seeds, SeedJob};
 
-use crate::{
-    check_write_permissions, credit_kinds, save_keypair, ABORTED,
-    TOTAL_ATTEMPTS,
-};
+use crate::{credit_kinds, save_keypair, ABORTED, TOTAL_ATTEMPTS};
 #[cfg(any(test, not(target_arch = "aarch64")))]
 use sha2::{Digest, Sha512};
 use std::sync::atomic::Ordering;
@@ -174,86 +176,135 @@ pub(crate) fn scalarmult_compress_scalar(
 // ─── SIMD (AVX-512 IFMA) batch keygen ────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
-fn simd_table() -> &'static [u64] {
-    static T: OnceLock<[u64; simd::SIMD_TABLE_LEN]> = OnceLock::new();
-    &T.get_or_init(simd::build_simd_table)[..]
+pub(crate) fn simd_table() -> &'static simd::SimdTable {
+    static T: OnceLock<simd::SimdTable> = OnceLock::new();
+    T.get_or_init(simd::build_simd_table)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
-unsafe fn keygen_batch_simd(
-    seeds: &mut [[u8; 32]; BATCH],
-    used: &mut [[u8; 32]; BATCH],
-    pubkeys: &mut [[u8; 32]; BATCH],
-) {
-    let table = simd_table();
-    const GROUPS: usize = BATCH / 8;
-    debug_assert_eq!(BATCH % 8, 0);
-    let mut points = [simd::Point8::identity(); GROUPS];
-    for g in 0..GROUPS {
-        let base = g * 8;
-        for j in 0..8 {
-            used[base + j] = seeds[base + j];
-        }
-        let chunk: &[[u8; 32]; 8] = (&seeds[base..base + 8])
-            .try_into()
-            .unwrap();
-        let digests = sha512_simd::sha512_8(chunk);
-        let mut scalars = [[0u8; 32]; 8];
-        for j in 0..8 {
-            scalars[j] = clamp(&digests[j]);
-            seeds[base + j].copy_from_slice(&digests[j][32..64]);
-        }
-        points[g] = simd::scalarmult8(&scalars, table);
+/// Build the lookup tables the CPU workers use, so that their cost lands
+/// before the grind clock starts rather than on the reported rate.
+pub fn init_cpu_tables() {
+    #[cfg(target_arch = "x86_64")]
+    if simd::available() {
+        simd_table();
+        return;
     }
-    // Single inversion for all GROUPS*8 keys (Montgomery batch trick).
-    simd::batch_compress(&points, &mut pubkeys[..]);
+    #[cfg(not(target_arch = "aarch64"))]
+    comb_table();
 }
 
 fn reseed_lane(seed: &mut [u8; 32]) {
     *seed = rand::random();
 }
 
+/// Last gate before a key can be saved: re-derive the public key from the seed
+/// with `ed25519_dalek`, and check it against the batch code's result and,
+/// through the base58 walk rather than byte ranges, against the patterns.
+fn verify_hit(
+    target: &MatchTargets,
+    seed: &[u8; 32],
+    pubkey: &[u8; 32],
+    mask: u64,
+) -> Result<(), String> {
+    let derived = ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes();
+    if derived != *pubkey {
+        return Err(format!(
+            "batch keygen produced {} but the seed derives {}",
+            fd_bs58::encode_32(*pubkey),
+            fd_bs58::encode_32(derived),
+        ));
+    }
+    let encoded = target.match_mask_encoded(&derived, mask);
+    if encoded != mask {
+        return Err(format!(
+            "{} claimed pattern mask {mask:#x} but encodes to {encoded:#x}",
+            fd_bs58::encode_32(derived),
+        ));
+    }
+    Ok(())
+}
+
+/// Handle a lane whose key matched `mask`. Returns true when the lane must be
+/// reseeded: the next chained seed is this key's nonce prefix, so it must not
+/// be ground on once the key may be published.
+fn take_hit(
+    target: &MatchTargets,
+    seed: &[u8; 32],
+    pubkey: &[u8; 32],
+    mask: u64,
+    max_count: u32,
+) -> bool {
+    if let Err(err) = verify_hit(target, seed, pubkey, mask) {
+        crate::ui_with_match(|| {
+            eprintln!("ERROR: refusing to save a bad keypair: {err}");
+            eprintln!("ERROR: this is a bug in vanity; grinding on");
+        });
+        return true;
+    }
+    if !credit_kinds(mask, max_count) {
+        return false;
+    }
+    let s = fd_bs58::encode_32(pubkey);
+    crate::ui_with_match(|| {
+        eprintln!("match: {s}");
+        eprintln!("pubkey: {s}");
+        save_keypair(seed, pubkey, &s);
+    });
+    true
+}
+
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
+#[target_feature(enable = "avx512f,avx512ifma,avx512dq,avx512bw")]
 unsafe fn grind_thread_simd(
     target: &MatchTargets,
     min_count: u32,
     max_count: u32,
 ) {
-    check_write_permissions();
-    let mut seeds: [[u8; 32]; BATCH] = [[0u8; 32]; BATCH];
-    for s in seeds.iter_mut() {
-        *s = rand::random();
+    let table = simd_table();
+    let mut batch = simd::KeyBatch::new();
+    for g in 0..simd::SIMD_GROUPS {
+        for lane in 0..8 {
+            batch.set_next_seed(g, lane, &rand::random());
+        }
     }
-    let mut used = [[0u8; 32]; BATCH];
-    let mut pubkeys = [[0u8; 32]; BATCH];
+    let mut active = 0u64;
+    let mut intervals = None;
     let mut local: u64 = 0;
 
     loop {
         if grind_done(min_count) {
             break;
         }
-        keygen_batch_simd(&mut seeds, &mut used, &mut pubkeys);
-        local += BATCH as u64;
+        // Kinds only ever fill up, so a mask or filter that went stale during
+        // the batch is a superset of what is wanted. The credit in `take_hit`
+        // has the final say, and no hit can be lost to staleness.
+        let unfilled = crate::unfilled_mask(max_count);
+        if unfilled != active {
+            active = unfilled;
+            intervals = target.prefix_filter(active);
+        }
+        batch.run(table, intervals.as_deref());
+        local += simd::SIMD_BATCH as u64;
         if local >= 4096 {
             TOTAL_ATTEMPTS.fetch_add(local, Ordering::Relaxed);
             local = 0;
         }
-        for j in 0..BATCH {
-            let mask = target.match_mask_active(
-                &pubkeys[j],
-                crate::unfilled_mask(max_count),
-            );
-            if mask != 0 && credit_kinds(mask, max_count) {
-                let s = fd_bs58::encode_32(pubkeys[j]);
-                crate::ui_with_match(|| {
-                    eprintln!("match: {s}");
-                    eprintln!("pubkey: {s}");
-                    save_keypair(&used[j], &pubkeys[j], &s);
-                });
-                reseed_lane(&mut seeds[j]);
+        for g in 0..simd::SIMD_GROUPS {
+            let mut lanes = batch.hits[g];
+            while lanes != 0 {
+                let lane = lanes.trailing_zeros() as usize;
+                lanes &= lanes - 1;
+                let pubkey = batch.pubkeys[g][lane];
+                let mask = target.match_mask_active(&pubkey, active);
+                if mask == 0 {
+                    continue;
+                }
+                let seed = batch.used_seed(g, lane);
+                if take_hit(target, &seed, &pubkey, mask, max_count) {
+                    batch.set_next_seed(g, lane, &rand::random());
+                }
             }
         }
     }
@@ -266,7 +317,6 @@ fn grind_thread_neon(
     min_count: u32,
     max_count: u32,
 ) {
-    check_write_permissions();
     let mut seeds: [[u8; 32]; BATCH] = [[0u8; 32]; BATCH];
     for s in seeds.iter_mut() {
         *s = rand::random();
@@ -292,13 +342,15 @@ fn grind_thread_neon(
                 &pubkeys[j],
                 crate::unfilled_mask(max_count),
             );
-            if mask != 0 && credit_kinds(mask, max_count) {
-                let s = fd_bs58::encode_32(pubkeys[j]);
-                crate::ui_with_match(|| {
-                    eprintln!("match: {s}");
-                    eprintln!("pubkey: {s}");
-                    save_keypair(&used[j], &pubkeys[j], &s);
-                });
+            if mask != 0
+                && take_hit(
+                    target,
+                    &used[j],
+                    &pubkeys[j],
+                    mask,
+                    max_count,
+                )
+            {
                 reseed_lane(&mut seeds[j]);
             }
         }
@@ -312,7 +364,6 @@ fn grind_thread_scalar(
     min_count: u32,
     max_count: u32,
 ) {
-    check_write_permissions();
     let mut seeds: [[u8; 32]; BATCH] = [[0u8; 32]; BATCH];
     for s in seeds.iter_mut() {
         *s = rand::random();
@@ -336,13 +387,15 @@ fn grind_thread_scalar(
                 &pubkeys[j],
                 crate::unfilled_mask(max_count),
             );
-            if mask != 0 && credit_kinds(mask, max_count) {
-                let s = fd_bs58::encode_32(pubkeys[j]);
-                crate::ui_with_match(|| {
-                    eprintln!("match: {s}");
-                    eprintln!("pubkey: {s}");
-                    save_keypair(&used[j], &pubkeys[j], &s);
-                });
+            if mask != 0
+                && take_hit(
+                    target,
+                    &used[j],
+                    &pubkeys[j],
+                    mask,
+                    max_count,
+                )
+            {
                 reseed_lane(&mut seeds[j]);
             }
         }
@@ -452,6 +505,53 @@ mod tests {
                 .verifying_key()
                 .to_bytes();
             assert_eq!(ours, theirs, "seed index {i}");
+        }
+    }
+
+    #[test]
+    fn verify_hit_requires_derived_key_and_pattern() {
+        let seed = [7u8; 32];
+        let pubkey = SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let addr = fd_bs58::encode_32(pubkey);
+        let target = MatchTargets::new(
+            &[(&addr[..3], ""), ("zzzzzzzzzzzz", "")],
+            false,
+        );
+        assert!(verify_hit(&target, &seed, &pubkey, 0b01).is_ok());
+
+        // A batch result that is not what the seed derives.
+        let mut wrong = pubkey;
+        wrong[31] ^= 0x80;
+        assert!(verify_hit(&target, &seed, &wrong, 0b01).is_err());
+        wrong = pubkey;
+        wrong[0] ^= 1;
+        assert!(verify_hit(&target, &seed, &wrong, 0b01).is_err());
+
+        // The right key, claiming a pattern it does not have.
+        assert!(verify_hit(&target, &seed, &pubkey, 0b10).is_err());
+        assert!(verify_hit(&target, &seed, &pubkey, 0b11).is_err());
+    }
+
+    // A rejected key must not use up the quota.
+    #[test]
+    fn take_hit_rejects_without_crediting() {
+        let seed = [9u8; 32];
+        let pubkey = SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let addr = fd_bs58::encode_32(pubkey);
+        let target = MatchTargets::new(&[(&addr[..3], "")], false);
+        let mut wrong = pubkey;
+        wrong[5] ^= 1;
+        crate::reset_quotas(1);
+        assert!(take_hit(&target, &seed, &wrong, 1, 1));
+        assert_eq!(crate::unfilled_mask(1), 1);
+        for addr in [addr, fd_bs58::encode_32(wrong)] {
+            assert!(
+                !std::path::Path::new(&format!("{addr}.json")).exists()
+            );
         }
     }
 

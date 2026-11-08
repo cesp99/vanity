@@ -2,3 +2,8 @@
 
 # macOS
 .DS_Store
+
+# Keypair files saved by grind-keypair / grind-doppler, and the hidden temp
+# file each is written through. They hold private keys: never commit them.
+/*.json
+/.*.json.*.tmp

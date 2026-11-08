@@ -58,7 +58,9 @@ vanity grinds three kinds of vanity output. All three share the same mining flag
 | [`grind-keypair`](#grind-a-vanity-keypair) | an **ed25519 keypair** | `base58(ed25519_pubkey(seed))` | slower (ed25519 per attempt) |
 | [`grind-doppler`](#grind-a-doppler-keypair) | an **ed25519 keypair** with sign-extendable segments | `ed25519_pubkey(seed)`, matched on bytes | slower (ed25519 per attempt) |
 
-Run `vanity <command> --help` for the full flag list.
+Run `vanity <command> --help` for the full flag list. A fourth command,
+[`wallet`](#use-a-found-wallet), checks a keypair file that `grind-keypair`
+saved and shows how to use it.
 
 ### Grind a vanity seed
 
@@ -67,6 +69,13 @@ Run `vanity <command> --help` for the full flag list.
 is `Pubkey::create_with_seed(base, seed, owner) = base58(SHA256(base ‖ seed ‖ owner))`.
 No ed25519 is involved, so it's dramatically faster — but the account is
 controlled by `base` (the signer), not by a standalone keypair.
+
+A `grind` address has **no private key**. It is a SHA-256 hash, not an
+ed25519 public key, so nothing can sign as it: the `base` keypair acts for it
+through `CreateAccountWithSeed` and the other `*WithSeed` system instructions.
+It cannot be imported into a wallet app, and `vanity wallet` does not apply to
+it. For an address you can import and sign with, use
+[`grind-keypair`](#grind-a-vanity-keypair).
 
 You supply the `--base` pubkey (the signer for the create instruction), the
 program `--owner`, and one or more `--pattern`s to match (base58). A pubkey
@@ -97,6 +106,12 @@ The match line reports the resulting address and the 16-character seed:
 gpu 0 match: abcJvoUM9mcmHewxCumNuG8sQGM3u51QB8Wi1RVmats in 0.603s
 out seed = [...] -> JcZmEdyCAWJ7q9XI
 ```
+
+On CPU, `grind` uses AVX-512 when the CPU has it (the `sha2` crate otherwise).
+Each thread fixes the first 12 seed characters and walks the last 4, so most
+of the SHA-256 work is done once per 14.8M seeds. A seed only names an account
+that `base` controls, so CPU seeds come from a counter with a random start per
+run rather than from a CSPRNG. They are still 16 alphanumeric characters.
 
 Recompute the address from a `base`/`owner`/`seed` at any time with `verify`:
 
@@ -139,18 +154,45 @@ vanity grind-keypair --pattern bob...xyz --num-gpus 1
 vanity grind-keypair --pattern Cavey...CooL --pattern Harmonic... --num-gpus 1
 ```
 
-On a match it prints the public key, the seed (hex), and a Solana-compatible
-keypair JSON array you can save to a file and use with the CLI / SDK:
+On a match it prints the address and saves the keypair as `<ADDRESS>.json`
+in the current directory. The file is a solana-keygen compatible JSON array
+of 64 numbers (the 32-byte secret seed, then the public key), readable only
+by you (mode 0600). The secret key is not printed:
 
 ```text
-gpu 0 match: bob... in 0.4s
-pubkey:   bob...xyz
-seed hex: 68e36f80...
-keypair json (solana-compatible): [104, 227, 111, ...]
+match: bob...xyz
+pubkey: bob...xyz
+keypair saved to: /home/you/vanity/bob...xyz.json
 ```
 
+GPU hits print `gpu 0 match: <ADDRESS> in 0.4s` in place of `match:`. Use
+the file with [`vanity wallet`](#use-a-found-wallet).
+
+Before grinding, vanity checks that it can create a file in the current
+directory and stops with an error if it cannot. Each key is written to a temp
+file, synced to disk, then linked into place, so a key file is either
+complete or absent, and an existing file is never overwritten. If the current
+directory stops working later (disk full, removed, remounted read-only), the
+key goes to `$HOME`, then to the temp directory (`$TMPDIR` or `/tmp`), with a
+`FALLBACK` notice and the full path. Only if every location fails does vanity
+print the keypair JSON to stderr, so that the key is not lost. That is the one
+case where it shows a secret; copy it into a file straight away.
+
+Which prefixes are easy: an address is a 32-byte number in base58, so it is
+43 or 44 characters long. About 94% of addresses have 44 characters, and a
+44-character address can only start with `1` to `J`. A prefix whose first
+character comes after `J` in the base58 alphabet (`K`-`Z`, `a`-`z`) only
+occurs in 43-character addresses, which makes it about 58 times rarer than a
+prefix of the same length starting with `2` to `H` (`J` itself is about 14
+times rarer). `Czzz` is about 58 times easier than `czzz` or `Kzzz`. The
+probability and expected attempts that vanity prints at the start already
+account for this.
+
 Add `--case-insensitive` to match the prefix/suffix ignoring case (except `L`,
-which has no lowercase form in base58).
+which has no lowercase form in base58). The case variants are not equally
+likely, for the reason above: `cesp99` matches 16 variants, and the 8 that
+start with `C` make up almost all of its probability, so it is about 8 times
+easier than `Cesp99` rather than 16. The printed estimate sums the variants.
 
 ### Grind a doppler keypair
 
@@ -180,19 +222,73 @@ vanity grind-doppler --segments 1 --num-gpus 1
 vanity grind-doppler --segments 2 --num-gpus 1
 ```
 
-On a match it prints the keypair (with Solana-compatible JSON array, same as
-`grind-keypair`) plus a per-segment breakdown including the assembly `.equ`
-constants for each segment:
+On a match it prints the address and a per-segment breakdown of the public
+key, including the assembly `.equ` constants for each segment, and saves the
+keypair file the same way as `grind-keypair`:
 
 ```text
 gpu 0 match: Gyqq...SrPP in 0.4s
-pubkey:   Gyqq...SrPP
-seed hex: a58004d0...
+pubkey: Gyqq...SrPP
 doppler: 1/4 sign-extendable segment(s)
   seg 0 (bytes 0-7):  0x2a768d76fb0b6fed (not sign-extendable)  =>  .equ EXPECTED_KEY_0, 0x2a768d76fb0b6fed
   seg 1 (bytes 8-15): imm32 149357322 (0x08e7030a)              =>  .equ EXPECTED_KEY_1, 0x08e7030a
   ...
+keypair saved to: /home/you/vanity/Gyqq...SrPP.json
 ```
+
+### Use a found wallet
+
+The `<ADDRESS>.json` file that `grind-keypair` and `grind-doppler` save is a
+normal Solana keypair file. `vanity wallet` checks one and shows how to use
+it. It requires the file to hold 64 numbers, requires the stored public key
+to be the one the secret key derives, signs and verifies a test message, and
+warns if other users can read the file. It prints no secret:
+
+```bash
+vanity wallet bob...xyz.json
+```
+
+```text
+address:    bob...xyz
+file:       /home/you/vanity/bob...xyz.json
+self-check: ok (signed and verified a test message)
+
+Solana CLI:
+  solana-keygen pubkey /home/you/vanity/bob...xyz.json
+  solana balance bob...xyz
+  solana transfer --from /home/you/vanity/bob...xyz.json <RECIPIENT> <AMOUNT>
+...
+```
+
+**Solana CLI.** The file works as-is anywhere the CLI takes a keypair:
+
+```bash
+solana-keygen pubkey bob...xyz.json              # prints the address
+solana-keygen verify <ADDRESS> bob...xyz.json    # checks file and address agree
+solana balance <ADDRESS>
+solana transfer --from bob...xyz.json <RECIPIENT> <AMOUNT>
+solana config set --keypair /full/path/bob...xyz.json   # make it the default wallet
+```
+
+**Phantom, Solflare and other wallet apps.** Their "Import private key"
+screen takes the 64-byte secret key in base58. `vanity wallet <FILE> --reveal`
+prints it, after a warning. It refuses unless stdout is an interactive
+terminal, so the key cannot end up in a pipe, a log file, or an AI assistant's
+transcript. Run it yourself in a terminal, paste the key into the wallet app,
+then clear the terminal and its scrollback.
+
+**Keep it safe.**
+
+- The JSON file *is* the wallet. Anyone with a copy controls the address, and
+  if every copy is lost, so are the funds. Back it up offline (for example an
+  encrypted USB drive or a password manager) before sending anything to the
+  address, and keep it at mode 0600 (`chmod 600 <FILE>`).
+- Never paste the file or the revealed key into a website, chat or support
+  form. Importing the key into a wallet app puts a copy on that device.
+- Move funds carefully: send a small test amount first, check it arrived with
+  `solana balance <ADDRESS>`, then send the rest.
+- vanity makes no network calls. It cannot check balances or send funds; use
+  the Solana CLI or a wallet app for that.
 
 ### Common options
 
@@ -220,6 +316,7 @@ Approximate single-device throughput:
 | Backend | Device | seeds/s | keypairs/s |
 | --- | --- | --- | --- |
 | CPU    | AMD EPYC 9275F (48 threads, AVX-512 IFMA) | ~201 M | ~33 M |
+| CPU    | AMD Ryzen AI 9 HX 370 (24 threads, AVX-512 IFMA; busy desktop, median of 3) | ~383 M | ~27 M |
 | CUDA   | RTX 4090   | ~8.6B B | ~240 M |
 | OpenCL | Apple Silicon | ~315 M  | ~15 M  |
 | Metal  | Apple M5 Pro (20 GPU cores) | unmeasured | ~36 M |

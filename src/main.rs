@@ -1,4 +1,5 @@
 mod fast;
+mod wallet;
 
 #[cfg(all(feature = "metal", not(target_os = "macos")))]
 compile_error!("the metal feature requires macOS");
@@ -12,6 +13,7 @@ use num_bigint::BigUint;
 use num_format::{Locale, ToFormattedString};
 use num_traits::{One, ToPrimitive, Zero};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "gpu")]
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 #[cfg(feature = "deploy")]
@@ -28,12 +30,12 @@ use {
         system_instruction, system_program, sysvar,
         transaction::Transaction,
     },
-    std::path::PathBuf,
 };
 
 use std::{
     array, fs,
-    io::Write,
+    io::{ErrorKind, IsTerminal, Write},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{
         atomic::{
@@ -51,6 +53,8 @@ pub enum Command {
     GrindKeypair(GrindKeypairArgs),
     GrindDoppler(DopplerArgs),
     Verify(VerifyArgs),
+    /// Check a keypair file from grind-keypair and show how to use it
+    Wallet(WalletArgs),
     #[cfg(feature = "deploy")]
     Deploy(DeployArgs),
 }
@@ -166,6 +170,17 @@ pub struct VerifyArgs {
     /// The seed to verify
     #[clap(long)]
     pub seed: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct WalletArgs {
+    /// Keypair file written by grind-keypair (solana-keygen JSON)
+    pub keypair: PathBuf,
+
+    /// Print the private key in base58, the form wallet apps such as
+    /// Phantom import. Refused unless stdout is a terminal.
+    #[clap(long, default_value_t = false)]
+    pub reveal: bool,
 }
 
 #[cfg(feature = "deploy")]
@@ -410,6 +425,35 @@ fn bs58_probability(
     suffix: &str,
     case_insensitive: bool,
 ) -> f64 {
+    if !case_insensitive {
+        return bs58_exact_probability(prefix, suffix);
+    }
+    // Case variants of a prefix are not equally likely: `C` can start a
+    // 44-character address and `c` cannot. So sum over the variants of the
+    // leading letters. Later letters, and the suffix, are as likely in one
+    // case as the other, so they count as a factor.
+    let prefix = maybe_bs58_aware_lowercase(prefix, true);
+    let suffix = maybe_bs58_aware_lowercase(suffix, true);
+    let mut head_len = 0;
+    let mut variants = 1.0;
+    for c in prefix.chars() {
+        variants *= bs58_ci_position_factor(c);
+        if variants > fast::MAX_CI_VARIANTS as f64 {
+            break;
+        }
+        head_len += c.len_utf8();
+    }
+    let (head, tail) = prefix.split_at(head_len);
+    let heads = fast::ci_variants(head, fast::MAX_CI_VARIANTS)
+        .unwrap_or_default();
+    heads
+        .iter()
+        .map(|h| bs58_exact_probability(&format!("{h}{tail}"), &suffix))
+        .sum::<f64>()
+        * bs58_ci_factor(tail, &suffix)
+}
+
+fn bs58_exact_probability(prefix: &str, suffix: &str) -> f64 {
     let zeros = prefix
         .chars()
         .take_while(|&c| c == '1')
@@ -421,14 +465,7 @@ fn bs58_probability(
         (1.0_f64 / 256.0).powi(zeros as i32) * (255.0 / 256.0)
     };
     let rem = 32_usize.saturating_sub(zeros);
-    let pure = bs58_pure_prefix_suffix_prob(pre_nz, suffix, rem);
-    let prob = p_zero * pure;
-
-    if case_insensitive {
-        prob * bs58_ci_factor(prefix, suffix)
-    } else {
-        prob
-    }
+    p_zero * bs58_pure_prefix_suffix_prob(pre_nz, suffix, rem)
 }
 
 // ─── --pattern ──────────────────────────────────────────────────────────────
@@ -956,8 +993,20 @@ fn main() {
         Command::GrindKeypair(args) => grind_keypair(args),
         Command::GrindDoppler(args) => grind_doppler(args),
         Command::Verify(args) => verify(args),
+        Command::Wallet(args) => wallet(args),
         #[cfg(feature = "deploy")]
         Command::Deploy(args) => deploy(args),
+    }
+}
+
+fn wallet(args: WalletArgs) {
+    let stdout = std::io::stdout();
+    let tty = stdout.is_terminal();
+    if let Err(err) =
+        wallet::run(&args.keypair, args.reveal, tty, &mut stdout.lock())
+    {
+        eprintln!("error: {err}");
+        std::process::exit(1);
     }
 }
 
@@ -1090,12 +1139,27 @@ fn grind(mut args: GrindArgs) {
     start_grind(spec.patterns.len());
     let live = spec.live_targets(target_count, max_count);
     #[cfg(feature = "gpu")]
-    eprintln!("using {} cpus, {} gpus", args.num_cpus, args.num_gpus);
+    eprintln!(
+        "using {} cpus, {} gpus (cpu backend: {})",
+        args.num_cpus,
+        args.num_gpus,
+        fast::sha256_simd::backend_name()
+    );
     #[cfg(not(feature = "gpu"))]
-    eprintln!("using {} cpus", args.num_cpus);
+    eprintln!(
+        "using {} cpus (cpu backend: {})",
+        args.num_cpus,
+        fast::sha256_simd::backend_name()
+    );
     eprintln!("{}", targets_header(target_count, max_count));
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let match_targets = {
+        let pairs = spec.pairs();
+        fast::MatchTargets::new(&pairs, spec.case_insensitive)
+    };
+    let job =
+        fast::SeedJob::new(args.base.to_bytes(), args.owner.to_bytes());
     let spec = Arc::new(spec);
 
     #[cfg(feature = "gpu")]
@@ -1177,57 +1241,41 @@ fn grind(mut args: GrindArgs) {
 
     (0..args.num_cpus).into_par_iter().for_each(|i| {
         let timer = Instant::now();
-        let mut local_batch = 0_u64;
-
-        let base_sha = Sha256::new().chain_update(args.base);
-        loop {
-            if done(target_count) {
-                if local_batch > 0 {
-                    TOTAL_ATTEMPTS.fetch_add(local_batch, Ordering::Relaxed);
-                }
-                return;
-            }
-
-            let seed: [u8; 16] = rand::random();
-            let seed: [u8; 16] = array::from_fn(|i| {
-                const ALNUM: &[u8] =
-                    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-                ALNUM[seed[i] as usize % ALNUM.len()]
-            });
-
-            let pubkey_bytes: [u8; 32] = base_sha
-                .clone()
-                .chain_update(seed)
-                .chain_update(args.owner)
-                .finalize()
-                .into();
-            let pubkey = fd_bs58::encode_32(pubkey_bytes);
-
-            local_batch += 1;
-            if local_batch >= 4096 {
-                TOTAL_ATTEMPTS.fetch_add(4096, Ordering::Relaxed);
-                local_batch -= 4096;
-            }
-
-            let mask = spec.match_mask(&pubkey);
-            if mask != 0 && credit_kinds(mask, max_count) {
-                if local_batch > 0 {
-                    TOTAL_ATTEMPTS.fetch_add(local_batch, Ordering::Relaxed);
-                    local_batch = 0;
+        fast::grind_seeds(
+            &job,
+            &match_targets,
+            max_count,
+            || done(target_count),
+            |seed, address, mask| {
+                let pubkey = match verify_seed_hit(
+                    &spec, &args.base, &args.owner, seed, address, mask,
+                ) {
+                    Ok(pubkey) => pubkey,
+                    Err(err) => {
+                        ui_with_match(|| {
+                            eprintln!(
+                                "ERROR: refusing to report a bad seed: {err}"
+                            );
+                            eprintln!(
+                                "ERROR: this is a bug in vanity; grinding on"
+                            );
+                        });
+                        return;
+                    }
+                };
+                if !credit_kinds(mask, max_count) {
+                    return;
                 }
                 let time_secs = timer.elapsed().as_secs_f64();
                 ui_with_match(|| {
                     eprintln!(
                         "cpu {i} match: {pubkey}; {seed:?} -> {} in {:.3}s",
-                        core::str::from_utf8(&seed).unwrap(),
+                        core::str::from_utf8(seed).unwrap(),
                         time_secs,
                     );
                 });
-                if done(target_count) {
-                    break;
-                }
-            }
-        }
+            },
+        );
     });
 
     #[cfg(feature = "gpu")]
@@ -1256,7 +1304,7 @@ fn grind(mut args: GrindArgs) {
 // ─── grind-keypair ──────────────────────────────────────────────────────────
 
 fn grind_keypair(mut args: GrindKeypairArgs) {
-    check_write_permissions();
+    ensure_cwd_writable();
     maybe_update_num_cpus(&mut args.num_cpus);
     let spec = resolve_spec(&args.spec);
     let (target_count, max_count) =
@@ -1355,6 +1403,9 @@ fn grind_keypair(mut args: GrindKeypairArgs) {
         None
     };
 
+    if args.num_cpus > 0 {
+        fast::init_cpu_tables();
+    }
     let grind_start = Instant::now();
     ui_start(live, grind_start);
     let reporter = spawn_ui_reporter(Arc::clone(&shutdown));
@@ -1395,7 +1446,7 @@ fn grind_keypair(mut args: GrindKeypairArgs) {
 // ─── doppler ──────────────────────────────────────────────────────────────
 
 fn grind_doppler(mut args: DopplerArgs) {
-    check_write_permissions();
+    ensure_cwd_writable();
     maybe_update_num_cpus(&mut args.num_cpus);
     assert!(
         (1..=4).contains(&args.segments),
@@ -1463,7 +1514,7 @@ fn grind_doppler(mut args: DopplerArgs) {
                                     i, pubkey_str, time_sec
                                 );
                                 print_doppler_result(
-                                    &found_seed,
+                                    &pubkey_bytes,
                                     &pubkey_str,
                                 );
                                 save_keypair(
@@ -1529,7 +1580,7 @@ fn grind_doppler(mut args: DopplerArgs) {
                     time_secs,
                     (global_rate as u64).to_formatted_string(&Locale::en)
                 );
-                print_doppler_result(&seed, &pubkey_str);
+                print_doppler_result(&pubkey_bytes, &pubkey_str);
                 save_keypair(&seed, &pubkey_bytes, &pubkey_str);
                 if done(target_count) {
                     break;
@@ -1561,6 +1612,37 @@ fn grind_doppler(mut args: DopplerArgs) {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// Last gate before a `grind` seed is reported: recompute the address with
+/// `Pubkey::create_with_seed`, require it to equal what the fast path hashed,
+/// and re-check every claimed kind against the base58 string.
+fn verify_seed_hit(
+    spec: &VanitySpec,
+    base: &Pubkey,
+    owner: &Pubkey,
+    seed: &[u8; 16],
+    address: &[u8; 32],
+    mask: u64,
+) -> Result<String, String> {
+    let seed_str = core::str::from_utf8(seed)
+        .map_err(|_| format!("seed {seed:?} is not utf-8"))?;
+    let derived = Pubkey::create_with_seed(base, seed_str, owner)
+        .map_err(|e| format!("seed {seed_str}: {e}"))?;
+    let pubkey = derived.to_string();
+    if derived.to_bytes() != *address {
+        return Err(format!(
+            "seed {seed_str} hashed to {} but derives {pubkey}",
+            fd_bs58::encode_32(address),
+        ));
+    }
+    let matched = spec.match_mask(&pubkey);
+    if matched & mask != mask {
+        return Err(format!(
+            "{pubkey} claimed pattern mask {mask:#x} but matches {matched:#x}"
+        ));
+    }
+    Ok(pubkey)
+}
 
 /// Count how many of the four 8-byte pubkey segments are sign-extendable
 /// 32-bit values: low 4 bytes are an i32, high 4 bytes are its sign extension.
@@ -1657,51 +1739,166 @@ fn format_target_label(prefix: &str, suffix: &str) -> String {
     }
 }
 
+/// Save a found keypair as a solana-keygen JSON file named after its
+/// address, in the current directory, and print the file's absolute path.
+///
+/// A key found after hours of grinding must not be lost. If the current
+/// directory fails (disk full, removed, remounted read-only), the file goes
+/// to $HOME, then to the temp dir. Only if all of those fail is the keypair
+/// printed to stderr. That is the one case in which grind-keypair shows
+/// secret key material, because the alternative is losing the key.
 pub(crate) fn save_keypair(
     seed: &[u8; 32],
     pubkey: &[u8; 32],
     pubkey_str: &str,
 ) {
+    let json = keypair_json(seed, pubkey);
+    let name = format!("{pubkey_str}.json");
+    let mut dirs =
+        vec![std::env::current_dir().unwrap_or_else(|_| ".".into())];
+    dirs.extend(std::env::var_os("HOME").map(PathBuf::from));
+    dirs.push(std::env::temp_dir());
+
+    for (i, dir) in dirs.iter().enumerate() {
+        let path = dir.join(&name);
+        match write_new_file(&path, json.as_bytes()) {
+            Ok(()) => {
+                if i > 0 {
+                    eprintln!(
+                        "keypair saved to a FALLBACK location; move it \
+                         somewhere safe"
+                    );
+                }
+                eprintln!("keypair saved to: {}", path.display());
+                return;
+            }
+            Err(err) => eprintln!(
+                "ERROR: could not save keypair to {}: {err}",
+                path.display()
+            ),
+        }
+    }
+    eprintln!(
+        "ERROR: the keypair for {pubkey_str} could not be saved."
+    );
+    eprintln!(
+        "ERROR: the next line is its PRIVATE KEY. Copy it into a file \
+         named {name} now; it is shown only this once:"
+    );
+    eprintln!("{json}");
+}
+
+/// solana-keygen keypair file contents: the 32-byte ed25519 seed, then the
+/// 32-byte public key, as a JSON array of numbers.
+fn keypair_json(seed: &[u8; 32], pubkey: &[u8; 32]) -> String {
     let bytes: Vec<u8> = seed
         .iter()
         .chain(pubkey.iter())
         .copied()
         .collect();
+    format!("{bytes:?}")
+}
 
-    let path = format!("{pubkey_str}.json");
-    let json = format!("{bytes:?}");
-
-    // Create file with mode 0600 so we don't expose the private key
-    // to other users on the box.
+/// Write `data` to a new file at `path`, readable only by its owner (on
+/// unix), and make it durable before returning. The data is written and
+/// synced to a temp file in the same directory first, then linked into
+/// place, so `path` is either absent or complete. An existing file is never
+/// replaced; one with identical contents counts as already saved.
+fn write_new_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let tmp = dir.join(format!(
+        ".{name}.{}.{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     let mut opts = fs::OpenOptions::new();
-    opts.write(true)
-        .create(true)
-        .truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-
-    match opts
-        .open(&path)
-        .and_then(|mut f| f.write_all(json.as_bytes()))
-    {
-        Ok(_) => eprintln!("keypair generated at: ./{}", path),
-        Err(err) => {
-            eprintln!("failed to write keypair to {path}: {err}")
+    let result = opts
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(data)?;
+            f.sync_all()
+        })
+        .and_then(|()| link_new(&tmp, path));
+    // After a link the temp name is a second name for the file; after a
+    // rename or a failure it is already gone or must not stay behind.
+    let _ = fs::remove_file(&tmp);
+    match result {
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            return if fs::read(path).is_ok_and(|old| old == data) {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "a different file already exists there",
+                ))
+            };
         }
+        result => result?,
+    }
+    // Persist the new directory entry. The file's own data is synced
+    // above; some filesystems refuse fsync on a directory, so this is
+    // best effort.
+    #[cfg(unix)]
+    let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+    Ok(())
+}
+
+/// Give `tmp` the name `path` unless something already has it. A hard link
+/// does this atomically. Filesystems without hard links fall back to an
+/// existence check and a rename.
+fn link_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match fs::hard_link(tmp, path) {
+        Err(err) if err.kind() != ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(tmp, path)
+        }
+        result => result,
     }
 }
 
-fn check_write_permissions() {
-    let current_dir =
-        std::env::current_dir().expect("we should've a dir");
-    let md = fs::metadata(current_dir).unwrap();
-    let permissions = md.permissions();
-    let readonly = permissions.readonly();
-    if readonly {
-        panic!("You're trying to grind a keypair but there's no write permissions on the current dir");
+/// Fail before grinding, rather than after a hit, if keypair files cannot
+/// be written to the current directory. Creates, syncs and removes a probe
+/// file, which also catches read-only mounts and ACLs that mode bits miss.
+fn ensure_cwd_writable() {
+    let dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: cannot use the current directory: {err}");
+            std::process::exit(1);
+        }
+    };
+    let probe =
+        dir.join(format!(".vanity-write-probe-{}", std::process::id()));
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut f| {
+            let written = f
+                .write_all(b"probe")
+                .and_then(|()| f.sync_all());
+            written.and(fs::remove_file(&probe))
+        });
+    if let Err(err) = result {
+        eprintln!(
+            "error: found keypairs are saved in the current directory, \
+             but {} is not writable: {err}",
+            dir.display()
+        );
+        eprintln!("error: run vanity from a writable directory");
+        std::process::exit(1);
     }
 }
 
@@ -1848,6 +2045,65 @@ fn maybe_update_num_cpus(num_cpus: &mut u32) {
 mod tests {
     use super::*;
 
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vanity-save-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saved_keypair_file_loads_as_a_wallet() {
+        // Throwaway test key.
+        let seed = [9u8; 32];
+        let pubkey = SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let dir = scratch_dir("roundtrip");
+        let path = dir.join("key.json");
+        write_new_file(&path, keypair_json(&seed, &pubkey).as_bytes())
+            .unwrap();
+        let key = wallet::load_keypair(&path).unwrap();
+        assert_eq!(key.verifying_key().to_bytes(), pubkey);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Only the key file is left: the temp file is gone.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_new_file_never_replaces_a_different_file() {
+        let dir = scratch_dir("noclobber");
+        let path = dir.join("key.json");
+        write_new_file(&path, b"first").unwrap();
+        // Saving the same contents again is fine.
+        write_new_file(&path, b"first").unwrap();
+        let err = write_new_file(&path, b"second").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_new_file_fails_in_a_missing_directory() {
+        let dir = scratch_dir("missing");
+        let path = dir.join("gone").join("key.json");
+        assert!(write_new_file(&path, b"x").is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn bs58_ci_factor_mithril_counts_i_once() {
         // Base58 has lowercase i but not uppercase I; old code assumed 2^6=64.
@@ -1859,6 +2115,29 @@ mod tests {
         assert_eq!(bs58_ci_position_factor('L'), 1.0);
         // Base58 has uppercase L but not lowercase l; pattern l still only maps to L.
         assert_eq!(bs58_ci_position_factor('l'), 1.0);
+    }
+
+    // Exact values: N in [2^248, 2^256) whose base58 form starts with any
+    // case variant, summed over the variants.
+    #[test]
+    fn ci_probability_weights_case_variants() {
+        let close = |got: f64, want: f64| {
+            assert!((got / want - 1.0).abs() < 0.01, "{got} vs {want}")
+        };
+        close(bs58_probability("cesp99", "", true), 7.318e-10);
+        close(bs58_probability("Cesp99", "", true), 7.318e-10);
+        close(bs58_probability("ce", "", true), 2.07e-3);
+        close(bs58_probability("Cesp99", "", false), 8.995e-11);
+        // No letters, nothing to fold.
+        assert_eq!(
+            bs58_probability("99", "2", true),
+            bs58_probability("99", "2", false)
+        );
+        // Letters past the expanded head count as a factor of two each.
+        let long = "abcdefghjk";
+        let head = bs58_probability(&long[..8], "", true);
+        let all = bs58_probability(long, "", true);
+        close(all, head * 4.0 / (58.0 * 58.0));
     }
 
     #[test]
@@ -1896,6 +2175,50 @@ mod tests {
                 suffix: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn verify_seed_hit_recomputes_address_and_pattern() {
+        let base = Pubkey::new_from_array([3u8; 32]);
+        let owner = Pubkey::from_str(
+            "BPFLoaderUpgradeab1e11111111111111111111111",
+        )
+        .unwrap();
+        let seed = *b"0123456789abcdef";
+        let address = Pubkey::create_with_seed(
+            &base,
+            core::str::from_utf8(&seed).unwrap(),
+            &owner,
+        )
+        .unwrap();
+        let addr = address.to_string();
+        let spec = VanitySpec {
+            patterns: vec![
+                VanityPattern {
+                    prefix: addr[..3].into(),
+                    suffix: String::new(),
+                },
+                VanityPattern {
+                    prefix: String::new(),
+                    suffix: "zzzzzzzz".into(),
+                },
+            ],
+            case_insensitive: false,
+        };
+        let check = |seed: &[u8; 16], address: &[u8; 32], mask| {
+            verify_seed_hit(&spec, &base, &owner, seed, address, mask)
+        };
+        let bytes = address.to_bytes();
+        assert_eq!(check(&seed, &bytes, 0b01), Ok(addr));
+        // The fast path hashed something else.
+        let mut wrong = bytes;
+        wrong[31] ^= 1;
+        assert!(check(&seed, &wrong, 0b01).is_err());
+        // The right address, claiming a pattern it does not have.
+        assert!(check(&seed, &bytes, 0b10).is_err());
+        assert!(check(&seed, &bytes, 0b11).is_err());
+        // A different seed for the same claimed address.
+        assert!(check(b"0123456789abcdeg", &bytes, 0b01).is_err());
     }
 
     #[test]
