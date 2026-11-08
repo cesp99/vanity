@@ -2,6 +2,27 @@
 
 A *bLaZinGlY fAsT* tool for grinding vanity addresses on Solana.
 
+> **This is a fork** of [cavemanloverboy/vanity](https://github.com/cavemanloverboy/vanity)
+> by Cavey Cool and Magnetar Fields. All credit for the original tool goes to them.
+>
+> Changes in this fork:
+> - **Faster CPU `grind-keypair`** (AVX-512 IFMA): a wide affine comb table, radix-51 field
+>   arithmetic, a specialized SHA-512 and a vectorized prefix filter. About 4-5x the
+>   original on a Ryzen AI 9 HX 370, at the cost of about 790 MB of RAM for the table.
+> - **Faster CPU `grind`**: precomputed SHA-256 midstates and schedule per seed prefix,
+>   16-lane AVX-512 hashing and byte-range matching. About 8x the original.
+> - **`vanity wallet`**: check a saved keypair and, on a terminal only, print the base58
+>   private key for importing into Phantom or Solflare.
+> - Safer key saving, a fix for `grind-doppler` printing the secret seed, and correct
+>   case-insensitive odds and ETAs.
+>
+> `cargo install vanity` installs the original crate from crates.io. To get this fork,
+> install it from source:
+>
+> ```bash
+> cargo install --git https://github.com/cesp99/vanity
+> ```
+
 ## 1) What
 
 Typically, solana developers wishing to obtain a vanity address for their program or token grind out ed25519 keypairs and sign off on a `SystemInstruction::CreateAccount` instruction. However, by using `SystemInstruction::CreateAccountWithSeed`, developers can bypass ed25519 and get extreme speedups on address searches. Although not as generic, this method covers many use cases.
