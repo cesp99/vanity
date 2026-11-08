@@ -1,13 +1,15 @@
 [package]
 name = "vanity"
-version = "0.10.1"
+version = "0.10.1-cesp99.1"
 edition = "2021"
 authors = [
     "Cavey Cool <caveycool@gmail.com>",
     "Magnetar Fields <0xMAGNETAR@proton.me>",
+    "Carlo Esposito <carlo@aploi.de>",
 ]
 license = "MIT OR Apache-2.0"
 description = "A *bLaZinGlY fAsT* tool for grinding vanity addresses on Solana"
+repository = "https://github.com/cesp99/vanity"
 
 [features]
 # CUDA backend (requires nvcc on the build machine). Historical default GPU

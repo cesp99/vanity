@@ -32,19 +32,19 @@ Typically, solana developers wishing to obtain a vanity address for their progra
 By default, vanity compiles for cpu:
 
 ```bash
-cargo install vanity
+cargo install --git https://github.com/cesp99/vanity
 ```
 
 To compile for an NVIDIA gpu (CUDA) — requires the CUDA toolkit (`nvcc`) on the build machine:
 
 ```bash
-cargo install vanity --features=gpu
+cargo install --git https://github.com/cesp99/vanity --features=gpu
 ```
 
 By default the CUDA build emits code for several architectures (Turing through Ada) plus a PTX fallback. For a faster, targeted build set `VANITY_CUDA_ARCH` to your GPU's compute capability — e.g. `86` for an RTX 3090, `89` for an RTX 4090, `80` for an A100, `90` for an H100:
 
 ```bash
-VANITY_CUDA_ARCH=86 cargo install vanity --features=gpu
+VANITY_CUDA_ARCH=86 cargo install --git https://github.com/cesp99/vanity --features=gpu
 ```
 
 If a launch prints `no kernel image is available for execution on the device`, the binary was built without your GPU's architecture — rebuild with the right `VANITY_CUDA_ARCH`.
@@ -54,7 +54,7 @@ Keypair CUDA builds use a width-8 affine comb table by default. Wider tables do 
 On Apple Silicon, build the native Metal backend:
 
 ```bash
-cargo install vanity --features=metal
+cargo install --git https://github.com/cesp99/vanity --features=metal
 ```
 
 Metal kernels compile at runtime with the system Metal framework (macOS only). This is the fast ed25519 path on Apple GPUs.
@@ -62,7 +62,7 @@ Metal kernels compile at runtime with the system Metal framework (macOS only). T
 On other machines without CUDA (AMD / Intel, or no NVIDIA driver), build the OpenCL backend instead:
 
 ```bash
-cargo install vanity --features=opencl
+cargo install --git https://github.com/cesp99/vanity --features=opencl
 ```
 
 The OpenCL backend needs only an OpenCL 1.2 ICD loader and headers at build time (`-lOpenCL` on Linux, the system `OpenCL.framework` on macOS); kernels are compiled at runtime for whatever device is present. It exposes the same CLI and `--num-gpus` flag as the CUDA build. The GPU backends are mutually exclusive — if more than one feature is enabled, `metal` is used, otherwise `opencl`, otherwise CUDA.
