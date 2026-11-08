@@ -243,7 +243,10 @@ mod p1p1_spike {
                 &n.y_minus_x,
                 &n.t2d,
             );
-            assert_eq!(muls, 7, "p1p1 chain does not beat the 7-mul affine add");
+            assert_eq!(
+                muls, 7,
+                "p1p1 chain does not beat the 7-mul affine add"
+            );
             acc = acc.add_niels(&n);
             let got = next.as_extended();
             assert_eq!(compress(&got), compress(&acc));

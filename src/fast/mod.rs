@@ -474,7 +474,10 @@ pub fn run_cpu_workers(
             }
             #[cfg(target_arch = "aarch64")]
             grind_thread_neon(target, min_count, max_count);
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64"
+            )))]
             grind_thread_scalar(target, min_count, max_count);
         });
 }

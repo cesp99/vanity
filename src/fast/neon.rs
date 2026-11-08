@@ -156,12 +156,12 @@ impl Fe4 {
 
     unsafe fn mul(self, o: Fe4) -> Fe4 {
         let (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9) = (
-            self.l[0], self.l[1], self.l[2], self.l[3], self.l[4], self.l[5],
-            self.l[6], self.l[7], self.l[8], self.l[9],
+            self.l[0], self.l[1], self.l[2], self.l[3], self.l[4],
+            self.l[5], self.l[6], self.l[7], self.l[8], self.l[9],
         );
         let (g0, g1, g2, g3, g4, g5, g6, g7, g8, g9) = (
-            o.l[0], o.l[1], o.l[2], o.l[3], o.l[4], o.l[5], o.l[6], o.l[7],
-            o.l[8], o.l[9],
+            o.l[0], o.l[1], o.l[2], o.l[3], o.l[4], o.l[5], o.l[6],
+            o.l[7], o.l[8], o.l[9],
         );
         let g1_19 = mul19_s(g1);
         let g2_19 = mul19_s(g2);
@@ -180,11 +180,17 @@ impl Fe4 {
         let mut h = [wmul(f0, g0); 10];
         h[0] = wadd(
             wadd(
-                wadd(wadd(wmul(f0, g0), wmul(f1_2, g9_19)), wmul(f2, g8_19)),
+                wadd(
+                    wadd(wmul(f0, g0), wmul(f1_2, g9_19)),
+                    wmul(f2, g8_19),
+                ),
                 wadd(wmul(f3_2, g7_19), wmul(f4, g6_19)),
             ),
             wadd(
-                wadd(wadd(wmul(f5_2, g5_19), wmul(f6, g4_19)), wmul(f7_2, g3_19)),
+                wadd(
+                    wadd(wmul(f5_2, g5_19), wmul(f6, g4_19)),
+                    wmul(f7_2, g3_19),
+                ),
                 wadd(wmul(f8, g2_19), wmul(f9_2, g1_19)),
             ),
         );
@@ -194,7 +200,10 @@ impl Fe4 {
                 wadd(wmul(f3, g8_19), wmul(f4, g7_19)),
             ),
             wadd(
-                wadd(wadd(wmul(f5, g6_19), wmul(f6, g5_19)), wmul(f7, g4_19)),
+                wadd(
+                    wadd(wmul(f5, g6_19), wmul(f6, g5_19)),
+                    wmul(f7, g4_19),
+                ),
                 wadd(wmul(f8, g3_19), wmul(f9, g2_19)),
             ),
         );
@@ -204,7 +213,10 @@ impl Fe4 {
                 wadd(wmul(f3_2, g9_19), wmul(f4, g8_19)),
             ),
             wadd(
-                wadd(wadd(wmul(f5_2, g7_19), wmul(f6, g6_19)), wmul(f7_2, g5_19)),
+                wadd(
+                    wadd(wmul(f5_2, g7_19), wmul(f6, g6_19)),
+                    wmul(f7_2, g5_19),
+                ),
                 wadd(wmul(f8, g4_19), wmul(f9_2, g3_19)),
             ),
         );
@@ -214,7 +226,10 @@ impl Fe4 {
                 wadd(wmul(f3, g0), wmul(f4, g9_19)),
             ),
             wadd(
-                wadd(wadd(wmul(f5, g8_19), wmul(f6, g7_19)), wmul(f7, g6_19)),
+                wadd(
+                    wadd(wmul(f5, g8_19), wmul(f6, g7_19)),
+                    wmul(f7, g6_19),
+                ),
                 wadd(wmul(f8, g5_19), wmul(f9, g4_19)),
             ),
         );
@@ -224,7 +239,10 @@ impl Fe4 {
                 wadd(wmul(f3_2, g1), wmul(f4, g0)),
             ),
             wadd(
-                wadd(wadd(wmul(f5_2, g9_19), wmul(f6, g8_19)), wmul(f7_2, g7_19)),
+                wadd(
+                    wadd(wmul(f5_2, g9_19), wmul(f6, g8_19)),
+                    wmul(f7_2, g7_19),
+                ),
                 wadd(wmul(f8, g6_19), wmul(f9_2, g5_19)),
             ),
         );
@@ -234,7 +252,10 @@ impl Fe4 {
                 wadd(wmul(f3, g2), wmul(f4, g1)),
             ),
             wadd(
-                wadd(wadd(wmul(f5, g0), wmul(f6, g9_19)), wmul(f7, g8_19)),
+                wadd(
+                    wadd(wmul(f5, g0), wmul(f6, g9_19)),
+                    wmul(f7, g8_19),
+                ),
                 wadd(wmul(f8, g7_19), wmul(f9, g6_19)),
             ),
         );
@@ -244,7 +265,10 @@ impl Fe4 {
                 wadd(wmul(f3_2, g3), wmul(f4, g2)),
             ),
             wadd(
-                wadd(wadd(wmul(f5_2, g1), wmul(f6, g0)), wmul(f7_2, g9_19)),
+                wadd(
+                    wadd(wmul(f5_2, g1), wmul(f6, g0)),
+                    wmul(f7_2, g9_19),
+                ),
                 wadd(wmul(f8, g8_19), wmul(f9_2, g7_19)),
             ),
         );
@@ -264,7 +288,10 @@ impl Fe4 {
                 wadd(wmul(f3_2, g5), wmul(f4, g4)),
             ),
             wadd(
-                wadd(wadd(wmul(f5_2, g3), wmul(f6, g2)), wmul(f7_2, g1)),
+                wadd(
+                    wadd(wmul(f5_2, g3), wmul(f6, g2)),
+                    wmul(f7_2, g1),
+                ),
                 wadd(wmul(f8, g0), wmul(f9_2, g9_19)),
             ),
         );
@@ -284,8 +311,8 @@ impl Fe4 {
 
     unsafe fn sq(self) -> Fe4 {
         let (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9) = (
-            self.l[0], self.l[1], self.l[2], self.l[3], self.l[4], self.l[5],
-            self.l[6], self.l[7], self.l[8], self.l[9],
+            self.l[0], self.l[1], self.l[2], self.l[3], self.l[4],
+            self.l[5], self.l[6], self.l[7], self.l[8], self.l[9],
         );
         let f0_2 = shl1(f0);
         let f1_2 = shl1(f1);
@@ -302,32 +329,62 @@ impl Fe4 {
         let f9_38 = vmulq_n_s32(f9, 38);
         let mut h = [wmul(f0, f0); 10];
         h[0] = wadd(
-            wadd(wadd(wmul(f0, f0), wmul(f1_2, f9_38)), wmul(f2_2, f8_19)),
-            wadd(wadd(wmul(f3_2, f7_38), wmul(f4_2, f6_19)), wmul(f5, f5_38)),
+            wadd(
+                wadd(wmul(f0, f0), wmul(f1_2, f9_38)),
+                wmul(f2_2, f8_19),
+            ),
+            wadd(
+                wadd(wmul(f3_2, f7_38), wmul(f4_2, f6_19)),
+                wmul(f5, f5_38),
+            ),
         );
         h[1] = wadd(
             wadd(wmul(f0_2, f1), wmul(f2, f9_38)),
-            wadd(wadd(wmul(f3_2, f8_19), wmul(f4, f7_38)), wmul(f5_2, f6_19)),
+            wadd(
+                wadd(wmul(f3_2, f8_19), wmul(f4, f7_38)),
+                wmul(f5_2, f6_19),
+            ),
         );
         h[2] = wadd(
-            wadd(wadd(wmul(f0_2, f2), wmul(f1_2, f1)), wmul(f3_2, f9_38)),
-            wadd(wadd(wmul(f4_2, f8_19), wmul(f5_2, f7_38)), wmul(f6, f6_19)),
+            wadd(
+                wadd(wmul(f0_2, f2), wmul(f1_2, f1)),
+                wmul(f3_2, f9_38),
+            ),
+            wadd(
+                wadd(wmul(f4_2, f8_19), wmul(f5_2, f7_38)),
+                wmul(f6, f6_19),
+            ),
         );
         h[3] = wadd(
             wadd(wmul(f0_2, f3), wmul(f1_2, f2)),
-            wadd(wadd(wmul(f4, f9_38), wmul(f5_2, f8_19)), wmul(f6, f7_38)),
+            wadd(
+                wadd(wmul(f4, f9_38), wmul(f5_2, f8_19)),
+                wmul(f6, f7_38),
+            ),
         );
         h[4] = wadd(
             wadd(wadd(wmul(f0_2, f4), wmul(f1_2, f3_2)), wmul(f2, f2)),
-            wadd(wadd(wmul(f5_2, f9_38), wmul(f6_2, f8_19)), wmul(f7, f7_38)),
+            wadd(
+                wadd(wmul(f5_2, f9_38), wmul(f6_2, f8_19)),
+                wmul(f7, f7_38),
+            ),
         );
         h[5] = wadd(
             wadd(wmul(f0_2, f5), wmul(f1_2, f4)),
-            wadd(wadd(wmul(f2_2, f3), wmul(f6, f9_38)), wmul(f7_2, f8_19)),
+            wadd(
+                wadd(wmul(f2_2, f3), wmul(f6, f9_38)),
+                wmul(f7_2, f8_19),
+            ),
         );
         h[6] = wadd(
-            wadd(wadd(wmul(f0_2, f6), wmul(f1_2, f5_2)), wmul(f2_2, f4)),
-            wadd(wadd(wmul(f3_2, f3), wmul(f7_2, f9_38)), wmul(f8, f8_19)),
+            wadd(
+                wadd(wmul(f0_2, f6), wmul(f1_2, f5_2)),
+                wmul(f2_2, f4),
+            ),
+            wadd(
+                wadd(wmul(f3_2, f3), wmul(f7_2, f9_38)),
+                wmul(f8, f8_19),
+            ),
         );
         h[7] = wadd(
             wadd(wmul(f0_2, f7), wmul(f1_2, f6)),
@@ -514,7 +571,9 @@ fn ref10_from_bytes(s: &[u8; 32]) -> [i32; 10] {
         u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]) as i64
     };
     let load3 = |i: usize| -> i64 {
-        (s[i] as i64) | ((s[i + 1] as i64) << 8) | ((s[i + 2] as i64) << 16)
+        (s[i] as i64)
+            | ((s[i + 1] as i64) << 8)
+            | ((s[i + 2] as i64) << 16)
     };
     let mut h = [0i64; 10];
     h[0] = load4(0);
@@ -530,12 +589,15 @@ fn ref10_from_bytes(s: &[u8; 32]) -> [i32; 10] {
     let c9 = (h[9] + (1 << 24)) >> 25;
     h[0] += c9 * 19;
     h[9] -= c9 << 25;
-    for (i, sh, nxt) in [(1, 25, 2), (3, 25, 4), (5, 25, 6), (7, 25, 8)] {
+    for (i, sh, nxt) in [(1, 25, 2), (3, 25, 4), (5, 25, 6), (7, 25, 8)]
+    {
         let c = (h[i] + (1 << (sh - 1))) >> sh;
         h[nxt] += c;
         h[i] -= c << sh;
     }
-    for (i, sh, nxt) in [(0, 26, 1), (2, 26, 3), (4, 26, 5), (6, 26, 7), (8, 26, 9)] {
+    for (i, sh, nxt) in
+        [(0, 26, 1), (2, 26, 3), (4, 26, 5), (6, 26, 7), (8, 26, 9)]
+    {
         let c = (h[i] + (1 << (sh - 1))) >> sh;
         h[nxt] += c;
         h[i] -= c << sh;
@@ -643,12 +705,16 @@ fn to_comb_digits(bytes: &[u8; 32]) -> [i16; COMB_WINDOWS] {
         carry = (digit + COMB_POS as i32) >> COMB_W;
         e[i] = (digit - (carry << COMB_W)) as i16;
     }
-    e[COMB_WINDOWS - 1] =
-        (e[COMB_WINDOWS - 1] as i32 + carry) as i16;
+    e[COMB_WINDOWS - 1] = (e[COMB_WINDOWS - 1] as i32 + carry) as i16;
     e
 }
 
-unsafe fn gather4(rows: &[Affine], window: usize, digits: [i16; 4], coord: u8) -> Fe4 {
+unsafe fn gather4(
+    rows: &[Affine],
+    window: usize,
+    digits: [i16; 4],
+    coord: u8,
+) -> Fe4 {
     let mut tmp = [[0i32; 10]; 4];
     for lane in 0..4 {
         let dig = digits[lane];
@@ -719,7 +785,8 @@ unsafe fn scalarmult4(scalars: &[[u8; 32]; 4]) -> P4 {
         t: Fe4::zero(),
     };
     for w in 0..COMB_WINDOWS {
-        let ds = [digits[0][w], digits[1][w], digits[2][w], digits[3][w]];
+        let ds =
+            [digits[0][w], digits[1][w], digits[2][w], digits[3][w]];
         let ypx = gather4(table, w, ds, 0);
         let ymx = gather4(table, w, ds, 1);
         let t2d = gather4(table, w, ds, 2);
@@ -781,7 +848,8 @@ mod tests {
     fn keygen4_matches_dalek() {
         let mut seeds = [[0u8; 32]; 8];
         for (i, s) in seeds.iter_mut().enumerate() {
-            *s = Sha512::digest((i as u32).to_le_bytes()).as_slice()[..32]
+            *s = Sha512::digest((i as u32).to_le_bytes()).as_slice()
+                [..32]
                 .try_into()
                 .unwrap();
         }

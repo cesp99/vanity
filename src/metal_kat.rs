@@ -26,8 +26,10 @@ fn metal_pubkeys_match_dalek() {
     let mut seeds = Vec::new();
     // RFC 8032 secret (the ed25519 seed).
     seeds.push([
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
-        0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84,
+        0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69,
+        0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
     ]);
     for i in 0u32..8 {
         let h: [u8; 64] = Sha512::digest(i.to_le_bytes()).into();
@@ -35,9 +37,13 @@ fn metal_pubkeys_match_dalek() {
     }
     for (i, seed) in seeds.iter().enumerate() {
         let mut out = [0u8; 32];
-        let rc = unsafe { vanity_metal_pubkey(seed.as_ptr(), out.as_mut_ptr()) };
+        let rc = unsafe {
+            vanity_metal_pubkey(seed.as_ptr(), out.as_mut_ptr())
+        };
         assert_eq!(rc, 0, "metal pubkey failed for seed {i}");
-        let theirs = SigningKey::from_bytes(seed).verifying_key().to_bytes();
+        let theirs = SigningKey::from_bytes(seed)
+            .verifying_key()
+            .to_bytes();
         assert_eq!(out, theirs, "metal pubkey mismatch for seed {i}");
     }
 }

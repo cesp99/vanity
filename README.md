@@ -67,8 +67,6 @@ cargo install vanity --features=opencl
 
 The OpenCL backend needs only an OpenCL 1.2 ICD loader and headers at build time (`-lOpenCL` on Linux, the system `OpenCL.framework` on macOS); kernels are compiled at runtime for whatever device is present. It exposes the same CLI and `--num-gpus` flag as the CUDA build. The GPU backends are mutually exclusive — if more than one feature is enabled, `metal` is used, otherwise `opencl`, otherwise CUDA.
 
-If you don't have a GPU, consider using [vast.ai](https://cloud.vast.ai/?ref_id=126830). Pls use this referral link so that I can keep using GPUs.
-
 ## Usage
 
 vanity grinds three kinds of vanity output. All three share the same mining flags (`--num-cpus`, `--num-gpus`, `--count`, and for pattern grinds `--max-count`) described in [Common options](#common-options).
